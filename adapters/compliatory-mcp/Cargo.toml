@@ -1,0 +1,20 @@
+[package]
+name = "compliatory-mcp"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+compliatory-application = { path = "../../crates/compliatory-application" }
+compliatory-core = { path = "../../crates/compliatory-core" }
+rmcp.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+compliatory-sqlite = { path = "../compliatory-sqlite" }
+
+[lints]
+workspace = true

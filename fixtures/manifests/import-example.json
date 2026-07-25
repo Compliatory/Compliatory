@@ -1,0 +1,17 @@
+{
+  "standard_id": "EXAMPLE-ORIGINAL",
+  "edition": "1",
+  "amendments": [],
+  "language": "en",
+  "usage_right": "Replace with the tenant's documented right to use this source",
+  "expected_units": [
+    {
+      "locator": {
+        "kind": "clause",
+        "clause": "1"
+      },
+      "heading": "Clause One",
+      "source_page": 1
+    }
+  ]
+}

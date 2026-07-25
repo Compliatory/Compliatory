@@ -1,0 +1,22 @@
+[package]
+name = "compliatory-sqlite"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+chrono.workspace = true
+compliatory-application = { path = "../../crates/compliatory-application" }
+compliatory-core = { path = "../../crates/compliatory-core" }
+rusqlite.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

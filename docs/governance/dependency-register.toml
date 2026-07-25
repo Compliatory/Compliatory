@@ -1,0 +1,31 @@
+format_version = 1
+
+[[dependency]]
+name = "rmcp"
+zone = "adapter"
+purpose = "Official MCP protocol SDK and STDIO transport"
+
+[[dependency]]
+name = "rusqlite"
+zone = "adapter"
+purpose = "Local relational persistence with bundled SQLite"
+
+[[dependency]]
+name = "pdf-extract"
+zone = "adapter"
+purpose = "Text extraction from administratively supplied PDFs"
+
+[[dependency]]
+name = "serde"
+zone = "governed"
+purpose = "Typed wire and persistence models"
+
+[[dependency]]
+name = "sha2"
+zone = "governed"
+purpose = "Content-addressed immutable identifiers"
+
+[[dependency]]
+name = "tiktoken-rs"
+zone = "governed"
+purpose = "Exact local o200k_base token accounting"
