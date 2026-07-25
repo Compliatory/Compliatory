@@ -701,6 +701,9 @@ impl RegulatoryRepository for SqliteRepository {
 }
 
 fn same_structural_reference(left: &NormativeRef, right: &NormativeRef) -> bool {
+    // Discovery and packet expansion may intentionally omit amendments to search every known
+    // amendment of an edition. Citation validation uses exact `NormativeRef` equality instead;
+    // do not reuse this helper for citation or approval decisions.
     left.standard_id == right.standard_id
         && left.edition == right.edition
         && (right.amendments.is_empty() || left.amendments == right.amendments)

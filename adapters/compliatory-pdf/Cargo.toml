@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-compliatory-core = { path = "../../crates/compliatory-core" }
-compliatory-sqlite = { path = "../compliatory-sqlite" }
+compliatory-core.workspace = true
+compliatory-sqlite.workspace = true
 pdf-extract.workspace = true
 rusqlite.workspace = true
 schemars.workspace = true
@@ -19,7 +19,7 @@ sha2.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
-compliatory-application = { path = "../../crates/compliatory-application" }
+compliatory-application.workspace = true
 lopdf.workspace = true
 tempfile.workspace = true
 

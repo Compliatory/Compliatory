@@ -8,13 +8,13 @@ rust-version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-compliatory-application = { path = "../../crates/compliatory-application" }
-compliatory-core = { path = "../../crates/compliatory-core" }
+compliatory-application.workspace = true
+compliatory-core.workspace = true
 rmcp.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
-compliatory-sqlite = { path = "../compliatory-sqlite" }
+compliatory-sqlite.workspace = true
 
 [lints]
 workspace = true

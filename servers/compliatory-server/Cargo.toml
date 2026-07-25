@@ -9,9 +9,9 @@ rust-version.workspace = true
 [dependencies]
 anyhow.workspace = true
 clap.workspace = true
-compliatory-application = { path = "../../crates/compliatory-application" }
-compliatory-mcp = { path = "../../adapters/compliatory-mcp" }
-compliatory-sqlite = { path = "../../adapters/compliatory-sqlite" }
+compliatory-application.workspace = true
+compliatory-mcp.workspace = true
+compliatory-sqlite.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 tokio.workspace = true

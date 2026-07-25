@@ -8,8 +8,8 @@ rust-version.workspace = true
 
 [dependencies]
 chrono.workspace = true
-compliatory-application = { path = "../../crates/compliatory-application" }
-compliatory-core = { path = "../../crates/compliatory-core" }
+compliatory-application.workspace = true
+compliatory-core.workspace = true
 rusqlite.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
