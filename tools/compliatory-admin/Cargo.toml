@@ -1,0 +1,23 @@
+[package]
+name = "compliatory-admin"
+version.workspace = true
+edition.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+compliatory-core.workspace = true
+compliatory-pdf.workspace = true
+compliatory-sqlite.workspace = true
+serde_json.workspace = true
+
+[dev-dependencies]
+compliatory-application.workspace = true
+tempfile.workspace = true
+
+[lints]
+workspace = true

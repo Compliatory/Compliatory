@@ -1,0 +1,28 @@
+[advisories]
+yanked = "deny"
+# `pdf-extract` 0.12 currently requires `lopdf` 0.42, which itself requires this unmaintained
+# parser. The actionable lopdf stack-overflow advisory is fixed by the 0.42 upgrade above.
+# Reassess when pdf-extract can remove this transitive dependency.
+ignore = ["RUSTSEC-2026-0192"]
+
+[licenses]
+confidence-threshold = 0.8
+allow = [
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "FSL-1.1-ALv2",
+    "ISC",
+    "MIT",
+    "MPL-2.0",
+    "Unicode-3.0",
+    "Zlib",
+]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

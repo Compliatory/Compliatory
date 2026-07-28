@@ -1,0 +1,9 @@
+.DS_Store
+/target/
+/.compliatory/
+*.db
+*.db-shm
+*.db-wal
+*.pdf
+!/fixtures/**/*.pdf
+.env

@@ -1,0 +1,57 @@
+[workspace]
+members = [
+    "crates/compliatory-core",
+    "crates/compliatory-application",
+    "adapters/compliatory-sqlite",
+    "adapters/compliatory-pdf",
+    "adapters/compliatory-mcp",
+    "servers/compliatory-server",
+    "tools/compliatory-admin",
+]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license-file = "LICENSE.md"
+repository = "https://github.com/ambroise-leclerc/Compliatory"
+rust-version = "1.92"
+
+[workspace.dependencies]
+compliatory-application = { path = "crates/compliatory-application", version = "0.1.0" }
+compliatory-core = { path = "crates/compliatory-core", version = "0.1.0" }
+compliatory-mcp = { path = "adapters/compliatory-mcp", version = "0.1.0" }
+compliatory-pdf = { path = "adapters/compliatory-pdf", version = "0.1.0" }
+compliatory-sqlite = { path = "adapters/compliatory-sqlite", version = "0.1.0" }
+
+anyhow = "1.0"
+base64 = "0.22"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env"] }
+hmac = "0.12"
+lopdf = "0.42"
+pdf-extract = "0.12"
+rmcp = { version = "2.2", features = ["server", "macros", "schemars", "transport-io"] }
+rusqlite = { version = "0.37", features = ["bundled"] }
+schemars = { version = "1.2", features = ["chrono04"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_jcs = "0.1"
+sha2 = "0.10"
+tempfile = "3.20"
+thiserror = "2.0"
+tiktoken-rs = "0.12"
+tokio = { version = "1.47", features = ["macros", "rt-multi-thread", "io-std", "signal"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+uuid = { version = "1.17", features = ["v4", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+needless_pass_by_value = "allow"
