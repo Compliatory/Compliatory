@@ -150,6 +150,18 @@ fn apply_migrations(
     connection: &mut Connection,
     migrations: &[(u32, &str)],
 ) -> Result<(), DomainError> {
+    for (expected_version, (actual_version, _)) in (1_u32..).zip(migrations) {
+        if *actual_version != expected_version {
+            return Err(DomainError::new(
+                ErrorCode::Internal,
+                format!(
+                    "invalid migration sequence: expected version {expected_version}, found \
+                     {actual_version}"
+                ),
+            ));
+        }
+    }
+
     let current_version: u32 = connection
         .query_row("PRAGMA user_version", [], |row| row.get(0))
         .map_err(db_error)?;
@@ -944,6 +956,39 @@ mod tests {
             )
             .unwrap();
         assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn malformed_migration_sequences_are_rejected_before_writing() {
+        for migrations in [
+            &[(2, "CREATE TABLE skipped_v1(id INTEGER);")][..],
+            &[
+                (1, "CREATE TABLE first(id INTEGER);"),
+                (3, "CREATE TABLE skipped_v2(id INTEGER);"),
+            ][..],
+            &[
+                (1, "CREATE TABLE first(id INTEGER);"),
+                (1, "CREATE TABLE duplicate(id INTEGER);"),
+            ][..],
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            let error = apply_migrations(&mut connection, migrations).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(error.message.contains("invalid migration sequence"));
+
+            let version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 0);
+            let table_count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 0);
+        }
     }
 
     #[test]
