@@ -245,12 +245,34 @@ impl SqliteRepository {
         Ok(())
     }
 
+    /// Inserts a fragment. `fragment_id` is derived entirely from `content_digest` (see
+    /// `DocumentFragment::new`), so a key collision with a different `content_digest` can only
+    /// happen through a SHA-256 collision or a tampered store; this method asserts that invariant
+    /// rather than relying on it, per ADR-007.
     pub fn insert_fragment(
         &self,
         tenant_id: &str,
         fragment: &DocumentFragment,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
+        let connection = self.connection()?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT content_json FROM fragments WHERE tenant_id = ?1 AND fragment_id = ?2",
+                params![tenant_id, fragment.fragment_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(existing_json) = existing {
+            let stored: DocumentFragment = serde_json::from_str(&existing_json)
+                .map_err(|error| DomainError::invalid(error.to_string()))?;
+            return if stored.content_digest == fragment.content_digest {
+                Ok(())
+            } else {
+                Err(immutable_conflict("fragment", &fragment.fragment_id))
+            };
+        }
         let json = serde_json::to_string(fragment)
             .map_err(|error| DomainError::invalid(error.to_string()))?;
         let corpus_version = fragment
@@ -269,11 +291,10 @@ impl SqliteRepository {
             fragment.reference.locator.display_key(),
             content
         );
-        let connection = self.connection()?;
         let transaction = connection.unchecked_transaction().map_err(db_error)?;
         transaction
             .execute(
-                "INSERT OR REPLACE INTO fragments(
+                "INSERT INTO fragments(
                     tenant_id, fragment_id, standard_id, edition, language, locator_key,
                     locator_kind, source_digest, layer, corpus_version, title, body_for_search,
                     content_json
@@ -299,12 +320,6 @@ impl SqliteRepository {
             .map_err(db_error)?;
         transaction
             .execute(
-                "DELETE FROM fragments_fts WHERE tenant_id = ?1 AND fragment_id = ?2",
-                params![tenant_id, fragment.fragment_id],
-            )
-            .map_err(db_error)?;
-        transaction
-            .execute(
                 "INSERT INTO fragments_fts(tenant_id, fragment_id, title, body)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![tenant_id, fragment.fragment_id, fragment.title, &searchable],
@@ -314,17 +329,43 @@ impl SqliteRepository {
         Ok(())
     }
 
+    /// Inserts a profile. Unlike fragments, `(profile_id, version)` is operator-assigned and not
+    /// content-derived, so a genuinely different body under an existing key is a real conflict,
+    /// not a hash-collision-level non-event.
     pub fn insert_profile(
         &self,
         tenant_id: &str,
         profile: &NormativeProfile,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
+        let connection = self.connection()?;
+        let existing: Option<String> = connection
+            .query_row(
+                "SELECT content_json FROM profiles
+                 WHERE tenant_id = ?1 AND profile_id = ?2 AND version = ?3",
+                params![
+                    tenant_id,
+                    profile.profile.profile_id,
+                    profile.profile.version
+                ],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some(existing_json) = existing {
+            let stored: NormativeProfile = serde_json::from_str(&existing_json)
+                .map_err(|error| DomainError::invalid(error.to_string()))?;
+            return if stored == *profile {
+                Ok(())
+            } else {
+                Err(immutable_conflict("profile", &profile.profile.profile_id))
+            };
+        }
         let json = serde_json::to_string(profile)
             .map_err(|error| DomainError::invalid(error.to_string()))?;
-        self.connection()?
+        connection
             .execute(
-                "INSERT OR REPLACE INTO profiles(tenant_id, profile_id, version, content_json)
+                "INSERT INTO profiles(tenant_id, profile_id, version, content_json)
                  VALUES (?1, ?2, ?3, ?4)",
                 params![
                     tenant_id,
@@ -337,6 +378,8 @@ impl SqliteRepository {
         Ok(())
     }
 
+    /// Inserts a relation. The composite key is the entire row, so a repeat insert of the same
+    /// key is always content-identical: there is no separate content axis to conflict over.
     pub fn insert_relation(
         &self,
         tenant_id: &str,
@@ -346,7 +389,7 @@ impl SqliteRepository {
     ) -> Result<(), DomainError> {
         self.connection()?
             .execute(
-                "INSERT OR REPLACE INTO relations(
+                "INSERT OR IGNORE INTO relations(
                     tenant_id, relation_type, source_fragment_id, target_fragment_id
                  ) VALUES (?1, ?2, ?3, ?4)",
                 params![
@@ -360,6 +403,10 @@ impl SqliteRepository {
         Ok(())
     }
 
+    /// Publishes a corpus version. `corpus_version` is operator-assigned, so its content axis
+    /// (`source_digest` and `status`) is compared explicitly, per ADR-007. A matching retry never
+    /// rewrites the stored row, so `approved_by`/`created_at` recorded at first publication are
+    /// preserved rather than silently replaced.
     pub fn publish_corpus(
         &self,
         tenant_id: &str,
@@ -368,9 +415,26 @@ impl SqliteRepository {
         approved_by: &str,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
-        self.connection()?
+        let connection = self.connection()?;
+        let existing: Option<(String, String)> = connection
+            .query_row(
+                "SELECT source_digest, status FROM corpus_versions
+                 WHERE tenant_id = ?1 AND corpus_version = ?2",
+                params![tenant_id, corpus_version],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(db_error)?;
+        if let Some((existing_digest, existing_status)) = existing {
+            return if existing_digest == source_digest && existing_status == "published" {
+                Ok(())
+            } else {
+                Err(immutable_conflict("corpus version", corpus_version))
+            };
+        }
+        connection
             .execute(
-                "INSERT OR REPLACE INTO corpus_versions(
+                "INSERT INTO corpus_versions(
                     tenant_id, corpus_version, source_digest, status, created_at, approved_by
                  ) VALUES (?1, ?2, ?3, 'published', ?4, ?5)",
                 params![
@@ -701,11 +765,35 @@ impl RegulatoryRepository for SqliteRepository {
     }
 
     fn save_packet(&self, auth: &AuthContext, packet: &WorkPacket) -> Result<(), DomainError> {
+        // `packet_id` is derived from `content_digest`, which excludes `created_at` (see
+        // `WorkPacket::assign_digest`); compare `content_digest` directly rather than full
+        // struct equality so replaying a deterministic build at a later timestamp is a no-op
+        // instead of a spurious conflict. The connection guard is scoped so it is released
+        // before `audit` reacquires it — holding it across that call would deadlock.
+        let existing_digest: Option<String> = {
+            let connection = self.connection()?;
+            connection
+                .query_row(
+                    "SELECT content_digest FROM packets WHERE tenant_id = ?1 AND packet_id = ?2",
+                    params![auth.tenant_id, packet.packet_id],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(db_error)?
+        };
+        if let Some(existing_digest) = existing_digest {
+            self.audit(auth, "packet_write", Some(&packet.packet_id), "allowed");
+            return if existing_digest == packet.content_digest {
+                Ok(())
+            } else {
+                Err(immutable_conflict("packet", &packet.packet_id))
+            };
+        }
         let json = serde_json::to_string(packet)
             .map_err(|error| DomainError::invalid(error.to_string()))?;
         self.connection()?
             .execute(
-                "INSERT OR IGNORE INTO packets(
+                "INSERT INTO packets(
                     tenant_id, packet_id, content_digest, content_json, created_at
                  ) VALUES (?1, ?2, ?3, ?4, ?5)",
                 params![
@@ -784,6 +872,15 @@ fn same_structural_reference(left: &NormativeRef, right: &NormativeRef) -> bool 
         && left.locator == right.locator
 }
 
+/// Different canonical content was submitted under an already-existing immutable key. See
+/// ADR-007.
+fn immutable_conflict(kind: &str, key: &str) -> DomainError {
+    DomainError::new(
+        ErrorCode::ImmutableConflict,
+        format!("{kind} {key} already exists with different content"),
+    )
+}
+
 fn layer_name(layer: ContentLayer) -> &'static str {
     match layer {
         ContentLayer::Catalog => "catalog",
@@ -821,13 +918,20 @@ fn io_error(error: std::io::Error) -> DomainError {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
     use compliatory_core::{
         Approval, Availability, ContentLayer, DocumentFragment, Locator, NormativeRef,
+        PacketBudget, Phase, Role,
     };
 
     use super::*;
 
     fn fragment(corpus: &str) -> DocumentFragment {
+        fragment_with_clause(corpus, "1")
+    }
+
+    fn fragment_with_clause(corpus: &str, clause: &str) -> DocumentFragment {
         DocumentFragment::new(
             ContentLayer::Normative,
             NormativeRef {
@@ -835,7 +939,7 @@ mod tests {
                 edition: "1".to_owned(),
                 amendments: vec![],
                 language: "en".to_owned(),
-                locator: Locator::clause("1"),
+                locator: Locator::clause(clause),
                 source_digest: format!("sha256:{}", "1".repeat(64)),
                 source_page: Some(1),
             },
@@ -850,6 +954,49 @@ mod tests {
             Some("Synthetic clause".to_owned()),
         )
         .unwrap()
+    }
+
+    fn profile(profile_id: &str, version: &str, title: &str) -> NormativeProfile {
+        NormativeProfile {
+            profile: ProfileRef {
+                profile_id: profile_id.to_owned(),
+                version: version.to_owned(),
+            },
+            title: title.to_owned(),
+            criteria: vec![],
+        }
+    }
+
+    fn work_packet() -> WorkPacket {
+        let mut packet = WorkPacket {
+            packet_id: String::new(),
+            content_digest: String::new(),
+            corpus_versions: vec!["corpus_a".to_owned()],
+            profile: ProfileRef {
+                profile_id: "profile-a".to_owned(),
+                version: "1".to_owned(),
+            },
+            phase: Phase::PrimaryEvaluation,
+            role: Role::Evaluator,
+            objective: "Synthetic objective".to_owned(),
+            normative_fragments: vec![],
+            guidance_fragments: vec![],
+            tenant_fragments: vec![],
+            definitions: vec![],
+            relations: vec![],
+            budget: PacketBudget {
+                requested_tokens: 100,
+                estimated_tokens: 10,
+                tokenizer_id: "registry:o200k_base".to_owned(),
+                estimator: "test".to_owned(),
+            },
+            omitted: vec![],
+            continuation_cursor: None,
+            parent_packet_id: None,
+            created_at: Utc::now(),
+        };
+        packet.assign_digest(&BTreeSet::new()).unwrap();
+        packet
     }
 
     #[test]
@@ -1027,5 +1174,228 @@ mod tests {
                 .unwrap()
                 .is_some()
         );
+    }
+
+    #[test]
+    fn equivalent_fragment_retry_is_a_no_op() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let fragment = fragment("corpus_a");
+        repository.insert_fragment("tenant-a", &fragment).unwrap();
+        repository.insert_fragment("tenant-a", &fragment).unwrap();
+        let count: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM fragments WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn fragment_content_mismatch_under_a_collided_key_is_rejected() {
+        // Fragment identifiers are content-derived, so this simulates a hash collision or a
+        // tampered store rather than a naturally reachable path; ADR-007 requires the invariant
+        // to be asserted rather than merely relied upon.
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository.ensure_tenant("tenant-a").unwrap();
+        let fragment = fragment("corpus_a");
+        let mut tampered = fragment.clone();
+        tampered.content_digest = format!("sha256:{}", "0".repeat(64));
+        let tampered_json = serde_json::to_string(&tampered).unwrap();
+        let locator_kind = serde_json::to_string(&fragment.reference.locator.kind)
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+        repository
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO fragments(
+                    tenant_id, fragment_id, standard_id, edition, language, locator_key,
+                    locator_kind, source_digest, layer, corpus_version, title, body_for_search,
+                    content_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    "tenant-a",
+                    fragment.fragment_id,
+                    fragment.reference.standard_id,
+                    fragment.reference.edition,
+                    fragment.reference.language,
+                    fragment.reference.locator.display_key(),
+                    locator_kind,
+                    fragment.reference.source_digest,
+                    "normative",
+                    "corpus_a",
+                    fragment.title,
+                    "irrelevant",
+                    tampered_json,
+                ],
+            )
+            .unwrap();
+
+        let error = repository
+            .insert_fragment("tenant-a", &fragment)
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
+    }
+
+    #[test]
+    fn equivalent_profile_retry_is_a_no_op() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let profile = profile("prof-a", "1", "Title A");
+        repository.insert_profile("tenant-a", &profile).unwrap();
+        repository.insert_profile("tenant-a", &profile).unwrap();
+    }
+
+    #[test]
+    fn differing_profile_content_under_existing_key_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository
+            .insert_profile("tenant-a", &profile("prof-a", "1", "Title A"))
+            .unwrap();
+        let error = repository
+            .insert_profile("tenant-a", &profile("prof-a", "1", "Title B"))
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
+
+        let auth = AuthContext::local_service("tenant-a", "agent");
+        let stored = repository
+            .profile(
+                &auth,
+                &ProfileRef {
+                    profile_id: "prof-a".to_owned(),
+                    version: "1".to_owned(),
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.title, "Title A");
+    }
+
+    #[test]
+    fn equivalent_corpus_publication_retry_is_a_no_op() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let digest = format!("sha256:{}", "1".repeat(64));
+        repository
+            .publish_corpus("tenant-a", "corpus-1", &digest, "subject:reviewer-a")
+            .unwrap();
+        repository
+            .publish_corpus("tenant-a", "corpus-1", &digest, "subject:reviewer-a")
+            .unwrap();
+        let count: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM corpus_versions WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn corpus_publication_retry_does_not_overwrite_the_original_approver() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let digest = format!("sha256:{}", "1".repeat(64));
+        repository
+            .publish_corpus("tenant-a", "corpus-1", &digest, "subject:reviewer-a")
+            .unwrap();
+        repository
+            .publish_corpus("tenant-a", "corpus-1", &digest, "subject:reviewer-b")
+            .unwrap();
+        let approved_by: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT approved_by FROM corpus_versions
+                 WHERE tenant_id = 'tenant-a' AND corpus_version = 'corpus-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(approved_by, "subject:reviewer-a");
+    }
+
+    #[test]
+    fn differing_corpus_source_digest_under_existing_version_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let first_digest = format!("sha256:{}", "1".repeat(64));
+        repository
+            .publish_corpus("tenant-a", "corpus-1", &first_digest, "subject:reviewer-a")
+            .unwrap();
+        let second_digest = format!("sha256:{}", "2".repeat(64));
+        let error = repository
+            .publish_corpus("tenant-a", "corpus-1", &second_digest, "subject:reviewer-b")
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
+    }
+
+    #[test]
+    fn relation_insert_is_idempotent() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository.ensure_tenant("tenant-a").unwrap();
+        let source = fragment_with_clause("corpus_a", "1");
+        let target = fragment_with_clause("corpus_a", "2");
+        repository.insert_fragment("tenant-a", &source).unwrap();
+        repository.insert_fragment("tenant-a", &target).unwrap();
+        for _ in 0..2 {
+            repository
+                .insert_relation(
+                    "tenant-a",
+                    "normative_reference",
+                    &source.fragment_id,
+                    &target.fragment_id,
+                )
+                .unwrap();
+        }
+        let count: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM relations WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn equivalent_packet_retry_is_a_no_op_even_with_a_later_timestamp() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository.ensure_tenant("tenant-a").unwrap();
+        let auth = AuthContext::local_service("tenant-a", "agent");
+        let mut packet = work_packet();
+        repository.save_packet(&auth, &packet).unwrap();
+        // The packet identity excludes `created_at` (see `WorkPacket::assign_digest`), so a
+        // replay at a later timestamp must still be treated as the same immutable content.
+        packet.created_at += chrono::Duration::seconds(60);
+        repository.save_packet(&auth, &packet).unwrap();
+        let count: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM packets WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn differing_packet_content_under_a_collided_id_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository.ensure_tenant("tenant-a").unwrap();
+        let auth = AuthContext::local_service("tenant-a", "agent");
+        let mut packet = work_packet();
+        repository.save_packet(&auth, &packet).unwrap();
+        packet.content_digest = format!("sha256:{}", "9".repeat(64));
+        let error = repository.save_packet(&auth, &packet).unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
     }
 }
