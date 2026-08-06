@@ -19,10 +19,18 @@ use compliatory_core::{
 use rusqlite::{Connection, OptionalExtension, params};
 use sha2::{Digest, Sha256};
 
-const MIGRATION: &str = r"
+/// Connection-level settings. These are not part of schema content: `journal_mode` cannot be
+/// changed inside a transaction, and `foreign_keys` must be reasserted on every connection.
+const CONNECTION_PRAGMAS: &str = r"
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
+";
 
+/// Schema migration 1. Uses `IF NOT EXISTS` so that a version-zero database created by the
+/// original monolithic schema (before `PRAGMA user_version` tracking existed) is adopted in place
+/// without data loss: applying this migration to such a database creates nothing and simply
+/// advances `user_version` to 1.
+const SCHEMA_V1: &str = r"
 CREATE TABLE IF NOT EXISTS tenants (
     tenant_id TEXT PRIMARY KEY,
     created_at TEXT NOT NULL
@@ -127,6 +135,65 @@ CREATE TABLE IF NOT EXISTS ingestions (
 );
 ";
 
+/// Ordered, numbered schema migrations. Append new migrations to the end; never edit or remove an
+/// already-shipped entry. Versions must be contiguous starting at 1 and are tracked in the
+/// database via `PRAGMA user_version`. See ADR-007.
+const MIGRATIONS: &[(u32, &str)] = &[(1, SCHEMA_V1)];
+
+/// Applies every migration in `migrations` whose version exceeds the database's current
+/// `user_version`, each in its own transaction. A database whose `user_version` already exceeds
+/// the newest version in `migrations` is rejected outright: opening it with an older binary must
+/// fail clearly rather than silently skip schema it does not understand. A failure partway through
+/// a single migration rolls back that migration's transaction completely; migrations that already
+/// committed in a previous run remain applied.
+fn apply_migrations(
+    connection: &mut Connection,
+    migrations: &[(u32, &str)],
+) -> Result<(), DomainError> {
+    for (expected_version, (actual_version, _)) in (1_u32..).zip(migrations) {
+        if *actual_version != expected_version {
+            return Err(DomainError::new(
+                ErrorCode::Internal,
+                format!(
+                    "invalid migration sequence: expected version {expected_version}, found \
+                     {actual_version}"
+                ),
+            ));
+        }
+    }
+
+    let current_version: u32 = connection
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(db_error)?;
+    let latest_version = migrations.last().map_or(0, |(version, _)| *version);
+    if current_version > latest_version {
+        return Err(DomainError::new(
+            ErrorCode::Internal,
+            format!(
+                "database schema version {current_version} is newer than the latest version \
+                 {latest_version} known to this binary; upgrade Compliatory before opening this \
+                 data directory"
+            ),
+        ));
+    }
+    for (version, sql) in migrations {
+        if *version <= current_version {
+            continue;
+        }
+        let transaction = connection.transaction().map_err(db_error)?;
+        transaction.execute_batch(sql).map_err(db_error)?;
+        transaction
+            .execute_batch(&format!("PRAGMA user_version = {version};"))
+            .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
+    }
+    Ok(())
+}
+
+fn run_migrations(connection: &mut Connection) -> Result<(), DomainError> {
+    apply_migrations(connection, MIGRATIONS)
+}
+
 pub struct SqliteRepository {
     connection: Mutex<Connection>,
     data_dir: PathBuf,
@@ -136,8 +203,11 @@ impl SqliteRepository {
     pub fn open(data_dir: impl AsRef<Path>) -> Result<Self, DomainError> {
         let data_dir = data_dir.as_ref().to_path_buf();
         fs::create_dir_all(data_dir.join("tenants")).map_err(io_error)?;
-        let connection = Connection::open(data_dir.join("compliatory.db")).map_err(db_error)?;
-        connection.execute_batch(MIGRATION).map_err(db_error)?;
+        let mut connection = Connection::open(data_dir.join("compliatory.db")).map_err(db_error)?;
+        connection
+            .execute_batch(CONNECTION_PRAGMAS)
+            .map_err(db_error)?;
+        run_migrations(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             data_dir,
@@ -145,8 +215,11 @@ impl SqliteRepository {
     }
 
     pub fn open_in_memory() -> Result<Self, DomainError> {
-        let connection = Connection::open_in_memory().map_err(db_error)?;
-        connection.execute_batch(MIGRATION).map_err(db_error)?;
+        let mut connection = Connection::open_in_memory().map_err(db_error)?;
+        connection
+            .execute_batch(CONNECTION_PRAGMAS)
+            .map_err(db_error)?;
+        run_migrations(&mut connection)?;
         Ok(Self {
             connection: Mutex::new(connection),
             data_dir: PathBuf::from(":memory:"),
@@ -815,6 +888,144 @@ mod tests {
                 .fragment_by_id(&auth, &fragment.fragment_id)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn new_database_reaches_the_latest_schema_version_deterministically() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let version: u32 = repository
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+    }
+
+    #[test]
+    fn version_zero_database_is_adopted_without_data_loss() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CONNECTION_PRAGMAS).unwrap();
+        // Simulate a database created by the original monolithic schema, before
+        // `PRAGMA user_version` tracking existed: `user_version` stays at its default of 0.
+        connection.execute_batch(SCHEMA_V1).unwrap();
+        connection
+            .execute(
+                "INSERT INTO tenants(tenant_id, created_at) VALUES ('tenant-a', '2020-01-01')",
+                [],
+            )
+            .unwrap();
+
+        run_migrations(&mut connection).unwrap();
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+        let tenant_id: String = connection
+            .query_row(
+                "SELECT tenant_id FROM tenants WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(tenant_id, "tenant-a");
+    }
+
+    #[test]
+    fn migration_failure_rolls_back_completely() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CONNECTION_PRAGMAS).unwrap();
+        let broken_migrations: &[(u32, &str)] = &[(
+            1,
+            "CREATE TABLE partial(id INTEGER); CREATE TABLE partial(id INTEGER);",
+        )];
+
+        let error = apply_migrations(&mut connection, broken_migrations).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+
+        let version: u32 = connection
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, 0);
+        let table_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'partial'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(table_count, 0);
+    }
+
+    #[test]
+    fn malformed_migration_sequences_are_rejected_before_writing() {
+        for migrations in [
+            &[(2, "CREATE TABLE skipped_v1(id INTEGER);")][..],
+            &[
+                (1, "CREATE TABLE first(id INTEGER);"),
+                (3, "CREATE TABLE skipped_v2(id INTEGER);"),
+            ][..],
+            &[
+                (1, "CREATE TABLE first(id INTEGER);"),
+                (1, "CREATE TABLE duplicate(id INTEGER);"),
+            ][..],
+        ] {
+            let mut connection = Connection::open_in_memory().unwrap();
+            let error = apply_migrations(&mut connection, migrations).unwrap_err();
+            assert_eq!(error.code, ErrorCode::Internal);
+            assert!(error.message.contains("invalid migration sequence"));
+
+            let version: u32 = connection
+                .query_row("PRAGMA user_version", [], |row| row.get(0))
+                .unwrap();
+            assert_eq!(version, 0);
+            let table_count: i64 = connection
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type = 'table'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(table_count, 0);
+        }
+    }
+
+    #[test]
+    fn database_newer_than_the_binary_is_rejected_clearly() {
+        let mut connection = Connection::open_in_memory().unwrap();
+        connection.execute_batch(CONNECTION_PRAGMAS).unwrap();
+        run_migrations(&mut connection).unwrap();
+
+        // An older binary only knows about a schema older than what is on disk.
+        let older_binary_migrations: &[(u32, &str)] = &[];
+        let error = apply_migrations(&mut connection, older_binary_migrations).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        assert!(error.message.contains("newer than"));
+    }
+
+    #[test]
+    fn restart_reopens_existing_data_without_remigrating() {
+        let data_dir = tempfile::tempdir().unwrap();
+        let fragment = fragment("corpus_a");
+        {
+            let repository = SqliteRepository::open(data_dir.path()).unwrap();
+            repository.insert_fragment("tenant-a", &fragment).unwrap();
+        }
+
+        let repository = SqliteRepository::open(data_dir.path()).unwrap();
+        let version: u32 = repository
+            .connection()
+            .unwrap()
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(version, MIGRATIONS.last().unwrap().0);
+        let auth = AuthContext::local_service("tenant-a", "agent");
+        assert!(
+            repository
+                .fragment_by_id(&auth, &fragment.fragment_id)
+                .unwrap()
+                .is_some()
         );
     }
 }
