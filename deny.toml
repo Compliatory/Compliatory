@@ -11,7 +11,7 @@ allow = [
     "Apache-2.0",
     "BSD-2-Clause",
     "BSD-3-Clause",
-    "FSL-1.1-ALv2",
+    "EUPL-1.2",
     "ISC",
     "MIT",
     "MPL-2.0",
