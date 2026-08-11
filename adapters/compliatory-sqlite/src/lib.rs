@@ -16,12 +16,13 @@ use compliatory_core::{
     ContentLayer, DocumentFragment, DomainError, ErrorCode, NormativeProfile, NormativeRef,
     ProfileRef, Relation, WorkPacket,
 };
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use sha2::{Digest, Sha256};
 
 const MIGRATION: &str = r"
 PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
+PRAGMA busy_timeout = 5000;
 
 CREATE TABLE IF NOT EXISTS tenants (
     tenant_id TEXT PRIMARY KEY,
@@ -182,8 +183,11 @@ impl SqliteRepository {
         fragment: &DocumentFragment,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
-        let connection = self.connection()?;
-        let existing: Option<String> = connection
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let existing: Option<String> = transaction
             .query_row(
                 "SELECT content_json FROM fragments WHERE tenant_id = ?1 AND fragment_id = ?2",
                 params![tenant_id, fragment.fragment_id],
@@ -195,7 +199,7 @@ impl SqliteRepository {
             let stored: DocumentFragment = serde_json::from_str(&existing_json)
                 .map_err(|error| DomainError::invalid(error.to_string()))?;
             return if stored.content_digest == fragment.content_digest {
-                Ok(())
+                transaction.commit().map_err(db_error)
             } else {
                 Err(immutable_conflict("fragment", &fragment.fragment_id))
             };
@@ -218,7 +222,6 @@ impl SqliteRepository {
             fragment.reference.locator.display_key(),
             content
         );
-        let transaction = connection.unchecked_transaction().map_err(db_error)?;
         transaction
             .execute(
                 "INSERT INTO fragments(
@@ -265,8 +268,11 @@ impl SqliteRepository {
         profile: &NormativeProfile,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
-        let connection = self.connection()?;
-        let existing: Option<String> = connection
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let existing: Option<String> = transaction
             .query_row(
                 "SELECT content_json FROM profiles
                  WHERE tenant_id = ?1 AND profile_id = ?2 AND version = ?3",
@@ -283,14 +289,14 @@ impl SqliteRepository {
             let stored: NormativeProfile = serde_json::from_str(&existing_json)
                 .map_err(|error| DomainError::invalid(error.to_string()))?;
             return if stored == *profile {
-                Ok(())
+                transaction.commit().map_err(db_error)
             } else {
                 Err(immutable_conflict("profile", &profile.profile.profile_id))
             };
         }
         let json = serde_json::to_string(profile)
             .map_err(|error| DomainError::invalid(error.to_string()))?;
-        connection
+        transaction
             .execute(
                 "INSERT INTO profiles(tenant_id, profile_id, version, content_json)
                  VALUES (?1, ?2, ?3, ?4)",
@@ -302,6 +308,7 @@ impl SqliteRepository {
                 ],
             )
             .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -342,8 +349,11 @@ impl SqliteRepository {
         approved_by: &str,
     ) -> Result<(), DomainError> {
         self.ensure_tenant(tenant_id)?;
-        let connection = self.connection()?;
-        let existing: Option<(String, String)> = connection
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+        let existing: Option<(String, String)> = transaction
             .query_row(
                 "SELECT source_digest, status FROM corpus_versions
                  WHERE tenant_id = ?1 AND corpus_version = ?2",
@@ -354,12 +364,12 @@ impl SqliteRepository {
             .map_err(db_error)?;
         if let Some((existing_digest, existing_status)) = existing {
             return if existing_digest == source_digest && existing_status == "published" {
-                Ok(())
+                transaction.commit().map_err(db_error)
             } else {
                 Err(immutable_conflict("corpus version", corpus_version))
             };
         }
-        connection
+        transaction
             .execute(
                 "INSERT INTO corpus_versions(
                     tenant_id, corpus_version, source_digest, status, created_at, approved_by
@@ -373,6 +383,7 @@ impl SqliteRepository {
                 ],
             )
             .map_err(db_error)?;
+        transaction.commit().map_err(db_error)?;
         Ok(())
     }
 
@@ -697,43 +708,52 @@ impl RegulatoryRepository for SqliteRepository {
         // struct equality so replaying a deterministic build at a later timestamp is a no-op
         // instead of a spurious conflict. The connection guard is scoped so it is released
         // before `audit` reacquires it — holding it across that call would deadlock.
-        let existing_digest: Option<String> = {
-            let connection = self.connection()?;
-            connection
+        let result = (|| -> Result<(), DomainError> {
+            let mut connection = self.connection()?;
+            let transaction = connection
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .map_err(db_error)?;
+            let existing_digest: Option<String> = transaction
                 .query_row(
                     "SELECT content_digest FROM packets WHERE tenant_id = ?1 AND packet_id = ?2",
                     params![auth.tenant_id, packet.packet_id],
                     |row| row.get(0),
                 )
                 .optional()
-                .map_err(db_error)?
-        };
-        if let Some(existing_digest) = existing_digest {
-            self.audit(auth, "packet_write", Some(&packet.packet_id), "allowed");
-            return if existing_digest == packet.content_digest {
-                Ok(())
+                .map_err(db_error)?;
+            if let Some(existing_digest) = existing_digest {
+                if existing_digest == packet.content_digest {
+                    transaction.commit().map_err(db_error)
+                } else {
+                    Err(immutable_conflict("packet", &packet.packet_id))
+                }
             } else {
-                Err(immutable_conflict("packet", &packet.packet_id))
-            };
-        }
-        let json = serde_json::to_string(packet)
-            .map_err(|error| DomainError::invalid(error.to_string()))?;
-        self.connection()?
-            .execute(
-                "INSERT INTO packets(
-                    tenant_id, packet_id, content_digest, content_json, created_at
-                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                params![
-                    auth.tenant_id,
-                    packet.packet_id,
-                    packet.content_digest,
-                    json,
-                    packet.created_at.to_rfc3339()
-                ],
-            )
-            .map_err(db_error)?;
-        self.audit(auth, "packet_write", Some(&packet.packet_id), "allowed");
-        Ok(())
+                let json = serde_json::to_string(packet)
+                    .map_err(|error| DomainError::invalid(error.to_string()))?;
+                transaction
+                    .execute(
+                        "INSERT INTO packets(
+                            tenant_id, packet_id, content_digest, content_json, created_at
+                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                        params![
+                            auth.tenant_id,
+                            packet.packet_id,
+                            packet.content_digest,
+                            json,
+                            packet.created_at.to_rfc3339()
+                        ],
+                    )
+                    .map_err(db_error)?;
+                transaction.commit().map_err(db_error)
+            }
+        })();
+        let decision = match &result {
+            Ok(()) => "allowed",
+            Err(error) if error.code == ErrorCode::ImmutableConflict => "immutable_conflict",
+            Err(_) => "error",
+        };
+        self.audit(auth, "packet_write", Some(&packet.packet_id), decision);
+        result
     }
 
     fn packet(
@@ -1186,5 +1206,85 @@ mod tests {
         packet.content_digest = format!("sha256:{}", "9".repeat(64));
         let error = repository.save_packet(&auth, &packet).unwrap_err();
         assert_eq!(error.code, ErrorCode::ImmutableConflict);
+        let decision: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT decision FROM access_audit
+                 WHERE tenant_id = 'tenant-a' AND action = 'packet_write'
+                 ORDER BY audit_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "immutable_conflict");
+    }
+
+    #[test]
+    fn concurrent_immutable_writes_converge_across_connections() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        fn run_concurrently<F>(repositories: &[Arc<SqliteRepository>], operation: F)
+        where
+            F: Fn(&SqliteRepository) -> Result<(), DomainError> + Send + Sync + 'static,
+        {
+            let barrier = Arc::new(Barrier::new(repositories.len()));
+            let operation = Arc::new(operation);
+            let handles: Vec<_> = repositories
+                .iter()
+                .map(|repository| {
+                    let repository = Arc::clone(repository);
+                    let barrier = Arc::clone(&barrier);
+                    let operation = Arc::clone(&operation);
+                    thread::spawn(move || {
+                        barrier.wait();
+                        operation(&repository)
+                    })
+                })
+                .collect();
+            for handle in handles {
+                handle.join().unwrap().unwrap();
+            }
+        }
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let repositories: Vec<_> = (0..2)
+            .map(|_| Arc::new(SqliteRepository::open(data_dir.path()).unwrap()))
+            .collect();
+        repositories[0].ensure_tenant("tenant-a").unwrap();
+
+        let profile = profile("prof-a", "1", "Title A");
+        run_concurrently(&repositories, move |repository| {
+            repository.insert_profile("tenant-a", &profile)
+        });
+
+        let fragment = fragment("corpus_a");
+        run_concurrently(&repositories, move |repository| {
+            repository.insert_fragment("tenant-a", &fragment)
+        });
+
+        let digest = format!("sha256:{}", "1".repeat(64));
+        run_concurrently(&repositories, move |repository| {
+            repository.publish_corpus("tenant-a", "corpus_a", &digest, "subject:reviewer")
+        });
+
+        let packet = work_packet();
+        run_concurrently(&repositories, move |repository| {
+            let auth = AuthContext::local_service("tenant-a", "agent");
+            repository.save_packet(&auth, &packet)
+        });
+
+        let connection = repositories[0].connection().unwrap();
+        for table in ["profiles", "fragments", "corpus_versions", "packets"] {
+            let count: i64 = connection
+                .query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(count, 1, "unexpected row count in {table}");
+        }
     }
 }
