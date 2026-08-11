@@ -17,6 +17,7 @@ pub enum ErrorCode {
     TokenizerUnknown,
     CorpusSuperseded,
     InvalidInput,
+    ImmutableConflict,
     Internal,
 }
 
@@ -34,6 +35,7 @@ impl ErrorCode {
             Self::TokenizerUnknown => "tokenizer_unknown",
             Self::CorpusSuperseded => "corpus_superseded",
             Self::InvalidInput => "invalid_input",
+            Self::ImmutableConflict => "immutable_conflict",
             Self::Internal => "internal",
         }
     }

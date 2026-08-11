@@ -181,6 +181,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn synthetic_fixture_seeding_is_idempotent() {
+        let repository = Arc::new(SqliteRepository::open_in_memory().unwrap());
+        seed_synthetic_fixtures(&repository, "tenant-a").unwrap();
+        seed_synthetic_fixtures(&repository, "tenant-a").unwrap();
+    }
+
+    #[test]
     fn fixtures_cover_do178_editions_without_substitution() {
         let repository = Arc::new(SqliteRepository::open_in_memory().unwrap());
         seed_synthetic_fixtures(&repository, "tenant-a").unwrap();
