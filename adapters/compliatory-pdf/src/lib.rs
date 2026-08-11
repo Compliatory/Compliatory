@@ -350,16 +350,31 @@ impl<'a> IngestionService<'a> {
 
     /// Builds the candidate fragments and calls `SqliteRepository::publish_ingestion`, which
     /// commits every fragment, the corpus version, and the ingestion's `published` transition in
-    /// one `SQLite` transaction. Replaying this on an already-published ingestion is safe: it
-    /// rebuilds the same deterministic content and the repository returns the existing corpus
-    /// version instead of writing again (see ADR-007, issue #9).
+    /// one `SQLite` transaction. Replaying this on an already-published ingestion returns its
+    /// stored record before loading or rebuilding the review bundle (see ADR-007, issue #9).
     pub fn publish(
         &self,
         tenant_id: &str,
         ingestion_id: &str,
     ) -> Result<IngestionRecord, DomainError> {
         let row = self.load_row(tenant_id, ingestion_id)?;
-        if row.state != "approved" && row.state != "published" {
+        if row.state == "published" {
+            if row.corpus_version.is_none() {
+                return Err(DomainError::new(
+                    ErrorCode::Internal,
+                    "published ingestion is missing its corpus version",
+                ));
+            }
+            return Ok(IngestionRecord {
+                ingestion_id: ingestion_id.to_owned(),
+                state: row.state,
+                source_digest: row.source_digest,
+                review_digest: row.review_digest,
+                failure_reason: row.failure_reason,
+                corpus_version: row.corpus_version,
+            });
+        }
+        if row.state != "approved" {
             return Err(DomainError::new(
                 ErrorCode::NotApproved,
                 "only an approved ingestion can be published",
@@ -711,6 +726,14 @@ mod tests {
             .unwrap();
         let published = service.publish("tenant-a", &ingested.ingestion_id).unwrap();
         assert!(published.corpus_version.is_some());
+        let review_path = service
+            .load_row("tenant-a", &ingested.ingestion_id)
+            .unwrap()
+            .review_path
+            .unwrap();
+        fs::remove_file(review_path).unwrap();
+        let replayed = service.publish("tenant-a", &ingested.ingestion_id).unwrap();
+        assert_eq!(replayed.corpus_version, published.corpus_version);
         let auth = AuthContext::local_service("tenant-a", "test");
         let fragment = repository
             .fragment_by_reference(
