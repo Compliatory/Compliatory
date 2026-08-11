@@ -14,7 +14,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2024"
 license-file = "LICENSE.md"
-repository = "https://github.com/ambroise-leclerc/Compliatory"
+repository = "https://github.com/Compliatory/Compliatory"
 rust-version = "1.92"
 
 [workspace.dependencies]

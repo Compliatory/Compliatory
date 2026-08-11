@@ -8,3 +8,4 @@
 | [ADR-004](ADR-004-mcp-contract-and-identity.md) | Accepted | Stable `reg://` resources, five tools and authenticated tenant context. |
 | [ADR-005](ADR-005-deterministic-packets.md) | Accepted | Canonical JSON, SHA-256, bounded atomic fragments and signed cursors. |
 | [ADR-006](ADR-006-administrative-ingestion.md) | Accepted | Human-controlled PDF quarantine, review and immutable publication. |
+| [ADR-007](ADR-007-immutable-writes-and-schema-evolution.md) | Accepted | Insert-only writes, `immutable_conflict`, atomic publication and `user_version` migrations. |

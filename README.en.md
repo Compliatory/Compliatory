@@ -24,4 +24,5 @@ See the [documentation](docs/README.md) and
 [architecture decision records](docs/adr/README.md).
 The [operations guide](docs/operations.md) covers local identity and the approved import lifecycle.
 
-**License:** FSL-1.1-ALv2.
+**License:** [EUPL-1.2](LICENSE.md), or separate commercial terms. See
+[LICENSING.md](LICENSING.md).

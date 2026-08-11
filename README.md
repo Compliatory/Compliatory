@@ -46,4 +46,5 @@ Le [guide opérateur](docs/operations.md) décrit l'identité locale et le cycle
 Compliatory ne distribue pas les textes IEC ou RTCA, ne reconstruit pas un texte manquant et ne
 constitue pas un avis réglementaire ou une certification.
 
-**Licence :** FSL-1.1-ALv2.
+**Licence :** [EUPL-1.2](LICENSE.md), ou conditions commerciales séparées. Voir
+[LICENSING.md](LICENSING.md).
