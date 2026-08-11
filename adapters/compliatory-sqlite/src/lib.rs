@@ -784,7 +784,7 @@ impl RegulatoryRepository for SqliteRepository {
         // struct equality so replaying a deterministic build at a later timestamp is a no-op
         // instead of a spurious conflict. The connection guard is scoped so it is released
         // before `audit` reacquires it — holding it across that call would deadlock.
-        let result = {
+        let result = (|| -> Result<(), DomainError> {
             let mut connection = self.connection()?;
             let transaction = connection
                 .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -822,8 +822,13 @@ impl RegulatoryRepository for SqliteRepository {
                     .map_err(db_error)?;
                 transaction.commit().map_err(db_error)
             }
+        })();
+        let decision = match &result {
+            Ok(()) => "allowed",
+            Err(error) if error.code == ErrorCode::ImmutableConflict => "immutable_conflict",
+            Err(_) => "error",
         };
-        self.audit(auth, "packet_write", Some(&packet.packet_id), "allowed");
+        self.audit(auth, "packet_write", Some(&packet.packet_id), decision);
         result
     }
 
@@ -1613,6 +1618,40 @@ mod tests {
         packet.content_digest = format!("sha256:{}", "9".repeat(64));
         let error = repository.save_packet(&auth, &packet).unwrap_err();
         assert_eq!(error.code, ErrorCode::ImmutableConflict);
+        let decision: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT decision FROM access_audit
+                 WHERE tenant_id = 'tenant-a' AND action = 'packet_write'
+                 ORDER BY audit_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "immutable_conflict");
+    }
+
+    #[test]
+    fn packet_database_failures_are_audited_as_errors() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let auth = AuthContext::local_service("missing-tenant", "agent");
+        let packet = work_packet();
+
+        let error = repository.save_packet(&auth, &packet).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        let decision: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT decision FROM access_audit
+                 WHERE tenant_id = 'missing-tenant' AND action = 'packet_write'
+                 ORDER BY audit_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "error");
     }
 
     #[test]
