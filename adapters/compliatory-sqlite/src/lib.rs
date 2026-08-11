@@ -260,74 +260,7 @@ impl SqliteRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let existing: Option<String> = transaction
-            .query_row(
-                "SELECT content_json FROM fragments WHERE tenant_id = ?1 AND fragment_id = ?2",
-                params![tenant_id, fragment.fragment_id],
-                |row| row.get(0),
-            )
-            .optional()
-            .map_err(db_error)?;
-        if let Some(existing_json) = existing {
-            let stored: DocumentFragment = serde_json::from_str(&existing_json)
-                .map_err(|error| DomainError::invalid(error.to_string()))?;
-            return if stored.content_digest == fragment.content_digest {
-                transaction.commit().map_err(db_error)
-            } else {
-                Err(immutable_conflict("fragment", &fragment.fragment_id))
-            };
-        }
-        let json = serde_json::to_string(fragment)
-            .map_err(|error| DomainError::invalid(error.to_string()))?;
-        let corpus_version = fragment
-            .approval
-            .as_ref()
-            .map(|approval| approval.corpus_version.as_str());
-        let content = fragment
-            .exact_text
-            .as_deref()
-            .or(fragment.explanatory_text.as_deref())
-            .or(fragment.title.as_deref())
-            .unwrap_or_default();
-        let searchable = format!(
-            "{} {} {}",
-            fragment.reference.standard_id,
-            fragment.reference.locator.display_key(),
-            content
-        );
-        transaction
-            .execute(
-                "INSERT INTO fragments(
-                    tenant_id, fragment_id, standard_id, edition, language, locator_key,
-                    locator_kind, source_digest, layer, corpus_version, title, body_for_search,
-                    content_json
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
-                params![
-                    tenant_id,
-                    fragment.fragment_id,
-                    fragment.reference.standard_id,
-                    fragment.reference.edition,
-                    fragment.reference.language,
-                    fragment.reference.locator.display_key(),
-                    serde_json::to_string(&fragment.reference.locator.kind)
-                        .map_err(|error| DomainError::invalid(error.to_string()))?
-                        .trim_matches('"'),
-                    fragment.reference.source_digest,
-                    layer_name(fragment.layer),
-                    corpus_version,
-                    fragment.title,
-                    &searchable,
-                    json,
-                ],
-            )
-            .map_err(db_error)?;
-        transaction
-            .execute(
-                "INSERT INTO fragments_fts(tenant_id, fragment_id, title, body)
-                 VALUES (?1, ?2, ?3, ?4)",
-                params![tenant_id, fragment.fragment_id, fragment.title, &searchable],
-            )
-            .map_err(db_error)?;
+        insert_fragment_statements(&transaction, tenant_id, fragment)?;
         transaction.commit().map_err(db_error)?;
         Ok(())
     }
@@ -426,38 +359,108 @@ impl SqliteRepository {
         let transaction = connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(db_error)?;
-        let existing: Option<(String, String)> = transaction
+        publish_corpus_statements(
+            &transaction,
+            tenant_id,
+            corpus_version,
+            source_digest,
+            approved_by,
+        )?;
+        transaction.commit().map_err(db_error)
+    }
+
+    /// Atomically publishes an ingestion: every candidate fragment, the corpus version row, and
+    /// the ingestion's `published` state transition commit in a single `SQLite` transaction, so a
+    /// failure at any step leaves no trace of the candidate corpus (ADR-007, issue #9). Replaying
+    /// an already-published ingestion returns the existing corpus version instead of writing
+    /// again or erroring, and a corpus version requested for a different already-published
+    /// ingestion is an `immutable_conflict` rather than a silent overwrite.
+    pub fn publish_ingestion(
+        &self,
+        tenant_id: &str,
+        ingestion_id: &str,
+        corpus_version: &str,
+        source_digest: &str,
+        approved_by: &str,
+        fragments: &[DocumentFragment],
+    ) -> Result<String, DomainError> {
+        self.ensure_tenant(tenant_id)?;
+        let mut connection = self.connection()?;
+        let transaction = connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(db_error)?;
+
+        let existing: Option<(String, Option<String>, String)> = transaction
             .query_row(
-                "SELECT source_digest, status FROM corpus_versions
-                 WHERE tenant_id = ?1 AND corpus_version = ?2",
-                params![tenant_id, corpus_version],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                "SELECT state, corpus_version, source_digest FROM ingestions
+                 WHERE tenant_id = ?1 AND ingestion_id = ?2",
+                params![tenant_id, ingestion_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .map_err(db_error)?;
-        if let Some((existing_digest, existing_status)) = existing {
-            return if existing_digest == source_digest && existing_status == "published" {
-                transaction.commit().map_err(db_error)
+        let (state, existing_corpus_version, ingestion_source_digest) = existing
+            .ok_or_else(|| DomainError::new(ErrorCode::UnknownReference, "ingestion not found"))?;
+        if ingestion_source_digest != source_digest {
+            return Err(DomainError::invalid(
+                "publication source digest does not match the approved ingestion",
+            ));
+        }
+        if state == "published" {
+            return if existing_corpus_version.as_deref() == Some(corpus_version) {
+                Ok(corpus_version.to_owned())
             } else {
-                Err(immutable_conflict("corpus version", corpus_version))
+                Err(immutable_conflict("ingestion publication", ingestion_id))
             };
         }
+        if state != "approved" {
+            return Err(DomainError::new(
+                ErrorCode::NotApproved,
+                "only an approved ingestion can be published",
+            ));
+        }
+        for fragment in fragments {
+            if fragment.reference.source_digest != source_digest {
+                return Err(DomainError::invalid(
+                    "publication fragment source digest does not match the ingestion",
+                ));
+            }
+            if fragment
+                .approval
+                .as_ref()
+                .map(|approval| approval.corpus_version.as_str())
+                != Some(corpus_version)
+            {
+                return Err(DomainError::invalid(
+                    "publication fragment does not belong to the requested corpus version",
+                ));
+            }
+        }
+
+        for fragment in fragments {
+            insert_fragment_statements(&transaction, tenant_id, fragment)?;
+        }
+        publish_corpus_statements(
+            &transaction,
+            tenant_id,
+            corpus_version,
+            source_digest,
+            approved_by,
+        )?;
         transaction
             .execute(
-                "INSERT INTO corpus_versions(
-                    tenant_id, corpus_version, source_digest, status, created_at, approved_by
-                 ) VALUES (?1, ?2, ?3, 'published', ?4, ?5)",
+                "UPDATE ingestions SET state = 'published', corpus_version = ?3, updated_at = ?4
+                 WHERE tenant_id = ?1 AND ingestion_id = ?2",
                 params![
                     tenant_id,
+                    ingestion_id,
                     corpus_version,
-                    source_digest,
-                    Utc::now().to_rfc3339(),
-                    approved_by
+                    Utc::now().to_rfc3339()
                 ],
             )
             .map_err(db_error)?;
         transaction.commit().map_err(db_error)?;
-        Ok(())
+        Ok(corpus_version.to_owned())
     }
 
     pub fn tenant_dir(&self, tenant_id: &str) -> Result<PathBuf, DomainError> {
@@ -901,6 +904,148 @@ fn immutable_conflict(kind: &str, key: &str) -> DomainError {
     )
 }
 
+/// Executes the insert-or-verify statements for one fragment against `connection`. Shared by the
+/// single-shot `insert_fragment` (which wraps this in its own transaction) and
+/// `publish_ingestion` (which runs it as part of a larger, caller-owned transaction) — accepting
+/// `&Connection` lets either a plain `Connection` or an active `Transaction` be passed via deref
+/// coercion, so this never opens or commits a transaction itself.
+fn insert_fragment_statements(
+    connection: &Connection,
+    tenant_id: &str,
+    fragment: &DocumentFragment,
+) -> Result<(), DomainError> {
+    let content = fragment
+        .exact_text
+        .as_deref()
+        .or(fragment.explanatory_text.as_deref())
+        .or(fragment.title.as_deref())
+        .unwrap_or_default();
+    let searchable = format!(
+        "{} {} {}",
+        fragment.reference.standard_id,
+        fragment.reference.locator.display_key(),
+        content
+    );
+    let existing: Option<String> = connection
+        .query_row(
+            "SELECT content_json FROM fragments WHERE tenant_id = ?1 AND fragment_id = ?2",
+            params![tenant_id, fragment.fragment_id],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some(existing_json) = existing {
+        let stored: DocumentFragment = serde_json::from_str(&existing_json)
+            .map_err(|error| DomainError::invalid(error.to_string()))?;
+        return if stored.content_digest == fragment.content_digest {
+            let indexed: bool = connection
+                .query_row(
+                    "SELECT EXISTS(
+                        SELECT 1 FROM fragments_fts WHERE tenant_id = ?1 AND fragment_id = ?2
+                     )",
+                    params![tenant_id, fragment.fragment_id],
+                    |row| row.get(0),
+                )
+                .map_err(db_error)?;
+            if !indexed {
+                connection
+                    .execute(
+                        "INSERT INTO fragments_fts(tenant_id, fragment_id, title, body)
+                         VALUES (?1, ?2, ?3, ?4)",
+                        params![tenant_id, fragment.fragment_id, fragment.title, &searchable],
+                    )
+                    .map_err(db_error)?;
+            }
+            Ok(())
+        } else {
+            Err(immutable_conflict("fragment", &fragment.fragment_id))
+        };
+    }
+    let json =
+        serde_json::to_string(fragment).map_err(|error| DomainError::invalid(error.to_string()))?;
+    let corpus_version = fragment
+        .approval
+        .as_ref()
+        .map(|approval| approval.corpus_version.as_str());
+    connection
+        .execute(
+            "INSERT INTO fragments(
+                tenant_id, fragment_id, standard_id, edition, language, locator_key,
+                locator_kind, source_digest, layer, corpus_version, title, body_for_search,
+                content_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+            params![
+                tenant_id,
+                fragment.fragment_id,
+                fragment.reference.standard_id,
+                fragment.reference.edition,
+                fragment.reference.language,
+                fragment.reference.locator.display_key(),
+                serde_json::to_string(&fragment.reference.locator.kind)
+                    .map_err(|error| DomainError::invalid(error.to_string()))?
+                    .trim_matches('"'),
+                fragment.reference.source_digest,
+                layer_name(fragment.layer),
+                corpus_version,
+                fragment.title,
+                &searchable,
+                json,
+            ],
+        )
+        .map_err(db_error)?;
+    connection
+        .execute(
+            "INSERT INTO fragments_fts(tenant_id, fragment_id, title, body)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![tenant_id, fragment.fragment_id, fragment.title, &searchable],
+        )
+        .map_err(db_error)?;
+    Ok(())
+}
+
+/// Executes the insert-or-verify statement for a corpus version against `connection`. See
+/// `insert_fragment_statements` for why this takes `&Connection` rather than owning a
+/// transaction.
+fn publish_corpus_statements(
+    connection: &Connection,
+    tenant_id: &str,
+    corpus_version: &str,
+    source_digest: &str,
+    approved_by: &str,
+) -> Result<(), DomainError> {
+    let existing: Option<(String, String)> = connection
+        .query_row(
+            "SELECT source_digest, status FROM corpus_versions
+             WHERE tenant_id = ?1 AND corpus_version = ?2",
+            params![tenant_id, corpus_version],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()
+        .map_err(db_error)?;
+    if let Some((existing_digest, existing_status)) = existing {
+        return if existing_digest == source_digest && existing_status == "published" {
+            Ok(())
+        } else {
+            Err(immutable_conflict("corpus version", corpus_version))
+        };
+    }
+    connection
+        .execute(
+            "INSERT INTO corpus_versions(
+                tenant_id, corpus_version, source_digest, status, created_at, approved_by
+             ) VALUES (?1, ?2, ?3, 'published', ?4, ?5)",
+            params![
+                tenant_id,
+                corpus_version,
+                source_digest,
+                Utc::now().to_rfc3339(),
+                approved_by
+            ],
+        )
+        .map_err(db_error)?;
+    Ok(())
+}
+
 fn layer_name(layer: ContentLayer) -> &'static str {
     match layer {
         ContentLayer::Catalog => "catalog",
@@ -1017,6 +1162,33 @@ mod tests {
         };
         packet.assign_digest(&BTreeSet::new()).unwrap();
         packet
+    }
+
+    fn seed_ingestion(
+        repository: &SqliteRepository,
+        tenant_id: &str,
+        ingestion_id: &str,
+        state: &str,
+    ) {
+        repository.ensure_tenant(tenant_id).unwrap();
+        let now = Utc::now().to_rfc3339();
+        repository
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO ingestions(
+                    tenant_id, ingestion_id, state, manifest_json, source_digest, source_path,
+                    approved_by, created_at, updated_at
+                 ) VALUES (?1, ?2, ?3, '{}', ?4, 'irrelevant', 'subject:reviewer', ?5, ?5)",
+                params![
+                    tenant_id,
+                    ingestion_id,
+                    state,
+                    format!("sha256:{}", "1".repeat(64)),
+                    now,
+                ],
+            )
+            .unwrap();
     }
 
     #[test]
@@ -1195,6 +1367,7 @@ mod tests {
                 .is_some()
         );
     }
+
     #[test]
     fn equivalent_fragment_retry_is_a_no_op() {
         let repository = SqliteRepository::open_in_memory().unwrap();
@@ -1207,6 +1380,35 @@ mod tests {
             .query_row(
                 "SELECT count(*) FROM fragments WHERE tenant_id = 'tenant-a'",
                 [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn equivalent_fragment_retry_restores_a_missing_search_index_row() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let fragment = fragment("corpus_a");
+        repository.insert_fragment("tenant-a", &fragment).unwrap();
+        repository
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM fragments_fts WHERE tenant_id = 'tenant-a' AND fragment_id = ?1",
+                params![fragment.fragment_id],
+            )
+            .unwrap();
+
+        repository.insert_fragment("tenant-a", &fragment).unwrap();
+
+        let count: i64 = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM fragments_fts
+                 WHERE tenant_id = 'tenant-a' AND fragment_id = ?1",
+                params![fragment.fragment_id],
                 |row| row.get(0),
             )
             .unwrap();
@@ -1431,7 +1633,339 @@ mod tests {
     }
 
     #[test]
-    fn concurrent_immutable_writes_converge_across_connections() {
+    fn packet_database_failures_are_audited_as_errors() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        let auth = AuthContext::local_service("missing-tenant", "agent");
+        let packet = work_packet();
+
+        let error = repository.save_packet(&auth, &packet).unwrap_err();
+        assert_eq!(error.code, ErrorCode::Internal);
+        let decision: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT decision FROM access_audit
+                 WHERE tenant_id = 'missing-tenant' AND action = 'packet_write'
+                 ORDER BY audit_id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(decision, "error");
+    }
+
+    #[test]
+    fn publish_ingestion_commits_fragments_corpus_and_ingestion_state_atomically() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "approved");
+        let fragments = vec![
+            fragment_with_clause("corpus_a", "1"),
+            fragment_with_clause("corpus_a", "2"),
+        ];
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let published = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &fragments,
+            )
+            .unwrap();
+        assert_eq!(published, "corpus_a");
+
+        let connection = repository.connection().unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM ingestions WHERE tenant_id = 'tenant-a' AND ingestion_id = 'ing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "published");
+        let fragment_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM fragments WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fragment_count, 2);
+        let corpus_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM corpus_versions WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(corpus_count, 1);
+    }
+
+    #[test]
+    fn publish_ingestion_rolls_back_completely_when_a_fragment_conflicts() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "approved");
+        let first = fragment_with_clause("corpus_a", "1");
+        let second = fragment_with_clause("corpus_a", "2");
+
+        // Pre-seed a colliding, differently-content row under `second`'s key so the fragment
+        // loop fails partway through, after `first` would already have succeeded on its own.
+        let mut tampered = second.clone();
+        tampered.content_digest = format!("sha256:{}", "0".repeat(64));
+        let tampered_json = serde_json::to_string(&tampered).unwrap();
+        let locator_kind = serde_json::to_string(&second.reference.locator.kind)
+            .unwrap()
+            .trim_matches('"')
+            .to_owned();
+        repository
+            .connection()
+            .unwrap()
+            .execute(
+                "INSERT INTO fragments(
+                    tenant_id, fragment_id, standard_id, edition, language, locator_key,
+                    locator_kind, source_digest, layer, corpus_version, title, body_for_search,
+                    content_json
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                params![
+                    "tenant-a",
+                    second.fragment_id,
+                    second.reference.standard_id,
+                    second.reference.edition,
+                    second.reference.language,
+                    second.reference.locator.display_key(),
+                    locator_kind,
+                    second.reference.source_digest,
+                    "normative",
+                    "corpus_a",
+                    second.title,
+                    "irrelevant",
+                    tampered_json,
+                ],
+            )
+            .unwrap();
+
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &[first.clone(), second],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
+
+        let connection = repository.connection().unwrap();
+        // Nothing from the candidate publication is visible, not even `first`, which would have
+        // succeeded on its own had it not shared a transaction with the conflicting fragment.
+        let first_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM fragments WHERE tenant_id = 'tenant-a' AND fragment_id = ?1",
+                params![first.fragment_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(first_count, 0);
+        let corpus_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM corpus_versions WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(corpus_count, 0);
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM ingestions WHERE tenant_id = 'tenant-a' AND ingestion_id = 'ing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "approved");
+    }
+
+    #[test]
+    fn publish_ingestion_retry_returns_the_existing_record_without_rewriting() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "approved");
+        let fragments = vec![fragment_with_clause("corpus_a", "1")];
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let first = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &fragments,
+            )
+            .unwrap();
+        let updated_at_first: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM ingestions
+                 WHERE tenant_id = 'tenant-a' AND ingestion_id = 'ing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+
+        let second = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &fragments,
+            )
+            .unwrap();
+        assert_eq!(first, second);
+        let updated_at_second: String = repository
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT updated_at FROM ingestions
+                 WHERE tenant_id = 'tenant-a' AND ingestion_id = 'ing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(updated_at_first, updated_at_second);
+    }
+
+    #[test]
+    fn publishing_a_different_corpus_version_for_an_already_published_ingestion_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "approved");
+        let fragments = vec![fragment_with_clause("corpus_a", "1")];
+        let digest = format!("sha256:{}", "1".repeat(64));
+        repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &fragments,
+            )
+            .unwrap();
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_b",
+                &digest,
+                "subject:reviewer",
+                &fragments,
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::ImmutableConflict);
+    }
+
+    #[test]
+    fn publishing_an_unapproved_ingestion_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "awaiting_review");
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::NotApproved);
+    }
+
+    #[test]
+    fn publication_rejects_metadata_unrelated_to_the_approved_ingestion() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        seed_ingestion(&repository, "tenant-a", "ing-1", "approved");
+        let source_digest = format!("sha256:{}", "1".repeat(64));
+        let unrelated_digest = format!("sha256:{}", "2".repeat(64));
+
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &unrelated_digest,
+                "subject:reviewer",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+
+        let mut unrelated_fragment = fragment("corpus_a");
+        unrelated_fragment.reference.source_digest = unrelated_digest;
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &source_digest,
+                "subject:reviewer",
+                &[unrelated_fragment],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+
+        let wrong_corpus_fragment = fragment("corpus_b");
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "ing-1",
+                "corpus_a",
+                &source_digest,
+                "subject:reviewer",
+                &[wrong_corpus_fragment],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::InvalidInput);
+
+        let connection = repository.connection().unwrap();
+        let state: String = connection
+            .query_row(
+                "SELECT state FROM ingestions WHERE tenant_id = 'tenant-a' AND ingestion_id = 'ing-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "approved");
+        let fragment_count: i64 = connection
+            .query_row("SELECT count(*) FROM fragments", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(fragment_count, 0);
+    }
+
+    #[test]
+    fn publishing_an_unknown_ingestion_is_rejected() {
+        let repository = SqliteRepository::open_in_memory().unwrap();
+        repository.ensure_tenant("tenant-a").unwrap();
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let error = repository
+            .publish_ingestion(
+                "tenant-a",
+                "missing",
+                "corpus_a",
+                &digest,
+                "subject:reviewer",
+                &[],
+            )
+            .unwrap_err();
+        assert_eq!(error.code, ErrorCode::UnknownReference);
+    }
+
+    #[test]
+    fn concurrent_direct_immutable_writes_converge_across_connections() {
         use std::{
             sync::{Arc, Barrier},
             thread,
@@ -1496,5 +2030,64 @@ mod tests {
                 .unwrap();
             assert_eq!(count, 1, "unexpected row count in {table}");
         }
+    }
+
+    #[test]
+    fn concurrent_publication_attempts_converge_to_one_result() {
+        use std::{
+            sync::{Arc, Barrier},
+            thread,
+        };
+
+        let data_dir = tempfile::tempdir().unwrap();
+        let repositories: Vec<_> = (0..8)
+            .map(|_| Arc::new(SqliteRepository::open(data_dir.path()).unwrap()))
+            .collect();
+        seed_ingestion(&repositories[0], "tenant-a", "ing-1", "approved");
+        let fragments = vec![fragment_with_clause("corpus_a", "1")];
+        let digest = format!("sha256:{}", "1".repeat(64));
+        let barrier = Arc::new(Barrier::new(repositories.len()));
+
+        let handles: Vec<_> = repositories
+            .iter()
+            .map(|repository| {
+                let repository = Arc::clone(repository);
+                let fragments = fragments.clone();
+                let digest = digest.clone();
+                let barrier = Arc::clone(&barrier);
+                thread::spawn(move || {
+                    barrier.wait();
+                    repository.publish_ingestion(
+                        "tenant-a",
+                        "ing-1",
+                        "corpus_a",
+                        &digest,
+                        "subject:reviewer",
+                        &fragments,
+                    )
+                })
+            })
+            .collect();
+        for handle in handles {
+            assert_eq!(handle.join().unwrap().unwrap(), "corpus_a");
+        }
+
+        let connection = repositories[0].connection().unwrap();
+        let fragment_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM fragments WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(fragment_count, 1);
+        let corpus_count: i64 = connection
+            .query_row(
+                "SELECT count(*) FROM corpus_versions WHERE tenant_id = 'tenant-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(corpus_count, 1);
     }
 }

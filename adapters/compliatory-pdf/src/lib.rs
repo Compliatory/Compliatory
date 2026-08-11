@@ -348,12 +348,32 @@ impl<'a> IngestionService<'a> {
         })
     }
 
+    /// Builds the candidate fragments and calls `SqliteRepository::publish_ingestion`, which
+    /// commits every fragment, the corpus version, and the ingestion's `published` transition in
+    /// one `SQLite` transaction. Replaying this on an already-published ingestion returns its
+    /// stored record before loading or rebuilding the review bundle (see ADR-007, issue #9).
     pub fn publish(
         &self,
         tenant_id: &str,
         ingestion_id: &str,
     ) -> Result<IngestionRecord, DomainError> {
         let row = self.load_row(tenant_id, ingestion_id)?;
+        if row.state == "published" {
+            if row.corpus_version.is_none() {
+                return Err(DomainError::new(
+                    ErrorCode::Internal,
+                    "published ingestion is missing its corpus version",
+                ));
+            }
+            return Ok(IngestionRecord {
+                ingestion_id: ingestion_id.to_owned(),
+                state: row.state,
+                source_digest: row.source_digest,
+                review_digest: row.review_digest,
+                failure_reason: row.failure_reason,
+                corpus_version: row.corpus_version,
+            });
+        }
         if row.state != "approved" {
             return Err(DomainError::new(
                 ErrorCode::NotApproved,
@@ -382,6 +402,7 @@ impl<'a> IngestionService<'a> {
             .clone()
             .ok_or_else(|| DomainError::new(ErrorCode::Internal, "missing approver"))?;
         let approved_at = Utc::now();
+        let mut fragments = Vec::with_capacity(review.units.len());
         for unit in review.units {
             let reference = compliatory_core::NormativeRef {
                 standard_id: review.manifest.standard_id.clone(),
@@ -392,7 +413,7 @@ impl<'a> IngestionService<'a> {
                 source_digest: review.source_digest.clone(),
                 source_page: unit.source_page,
             };
-            let fragment = DocumentFragment::new(
+            fragments.push(DocumentFragment::new(
                 compliatory_core::ContentLayer::Normative,
                 reference,
                 Availability::Available,
@@ -404,35 +425,23 @@ impl<'a> IngestionService<'a> {
                     approved_by: approver.clone(),
                 }),
                 Some(unit.heading),
-            )?;
-            self.repository.insert_fragment(tenant_id, &fragment)?;
+            )?);
         }
-        self.repository.publish_corpus(
+        let published_corpus_version = self.repository.publish_ingestion(
             tenant_id,
+            ingestion_id,
             &corpus_version,
             &row.source_digest,
             &approver,
+            &fragments,
         )?;
-        self.repository
-            .connection()?
-            .execute(
-                "UPDATE ingestions SET state = 'published', corpus_version = ?3, updated_at = ?4
-                 WHERE tenant_id = ?1 AND ingestion_id = ?2",
-                params![
-                    tenant_id,
-                    ingestion_id,
-                    corpus_version,
-                    Utc::now().to_rfc3339()
-                ],
-            )
-            .map_err(db_error)?;
         Ok(IngestionRecord {
             ingestion_id: ingestion_id.to_owned(),
             state: "published".to_owned(),
             source_digest: row.source_digest,
             review_digest: row.review_digest,
             failure_reason: None,
-            corpus_version: Some(corpus_version),
+            corpus_version: Some(published_corpus_version),
         })
     }
 
@@ -717,6 +726,14 @@ mod tests {
             .unwrap();
         let published = service.publish("tenant-a", &ingested.ingestion_id).unwrap();
         assert!(published.corpus_version.is_some());
+        let review_path = service
+            .load_row("tenant-a", &ingested.ingestion_id)
+            .unwrap()
+            .review_path
+            .unwrap();
+        fs::remove_file(review_path).unwrap();
+        let replayed = service.publish("tenant-a", &ingested.ingestion_id).unwrap();
+        assert_eq!(replayed.corpus_version, published.corpus_version);
         let auth = AuthContext::local_service("tenant-a", "test");
         let fragment = repository
             .fragment_by_reference(
