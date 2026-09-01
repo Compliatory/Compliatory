@@ -12,9 +12,9 @@ use rmcp::{
     ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     handler::server::wrapper::{Json, Parameters},
     model::{
-        Implementation, ListResourceTemplatesResult, ListResourcesResult, PaginatedRequestParams,
-        ReadResourceRequestParams, ReadResourceResult, ResourceContents, ResourceTemplate,
-        ServerCapabilities, ServerInfo,
+        Implementation, ListResourceTemplatesResult, ListResourcesResult, ListToolsResult,
+        PaginatedRequestParams, ReadResourceRequestParams, ReadResourceResult, ResourceContents,
+        ResourceTemplate, ServerCapabilities, ServerInfo,
     },
     service::RequestContext,
     tool, tool_handler, tool_router,
@@ -136,22 +136,34 @@ impl ServerHandler for CompliatoryMcpServer {
         )
     }
 
-    async fn list_resources(
+    fn list_tools(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourcesResult, McpError> {
-        // Dynamic tenant-scoped resources are deliberately advertised as templates. Packet URIs
-        // returned by build/expand can be read directly without revealing another tenant's list.
-        Ok(ListResourcesResult::with_all_items(vec![]))
+    ) -> impl Future<Output = Result<ListToolsResult, McpError>> {
+        std::future::ready(Ok(ListToolsResult {
+            tools: Self::tool_router().list_all(),
+            meta: None,
+            next_cursor: None,
+        }))
     }
 
-    async fn list_resource_templates(
+    fn list_resources(
         &self,
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ListResourceTemplatesResult, McpError> {
-        Ok(ListResourceTemplatesResult::with_all_items(vec![
+    ) -> impl Future<Output = Result<ListResourcesResult, McpError>> {
+        // Dynamic tenant-scoped resources are deliberately advertised as templates. Packet URIs
+        // returned by build/expand can be read directly without revealing another tenant's list.
+        std::future::ready(Ok(ListResourcesResult::with_all_items(vec![])))
+    }
+
+    fn list_resource_templates(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> impl Future<Output = Result<ListResourceTemplatesResult, McpError>> {
+        std::future::ready(Ok(ListResourceTemplatesResult::with_all_items(vec![
             ResourceTemplate::new(
                 "reg://standards/{standard_id}/{edition}/{language}/clauses/{locator}",
                 "regulatory-clause",
@@ -168,15 +180,15 @@ impl ServerHandler for CompliatoryMcpServer {
             ResourceTemplate::new("reg://packets/{packet_id}", "regulatory-work-packet")
                 .with_title("Immutable work packet")
                 .with_mime_type("application/json"),
-        ]))
+        ])))
     }
 
-    async fn read_resource(
+    fn read_resource(
         &self,
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
-    ) -> Result<ReadResourceResult, McpError> {
-        let resource = self
+    ) -> impl Future<Output = Result<ReadResourceResult, McpError>> {
+        let result = self
             .service
             .read_resource(&self.auth, &request.uri)
             .map_err(|error| {
@@ -188,12 +200,18 @@ impl ServerHandler for CompliatoryMcpServer {
                 } else {
                     domain_error(error)
                 }
-            })?;
-        let text = serde_json::to_string(&resource.value)
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(text, resource.uri).with_mime_type(resource.mime_type),
-        ]))
+            })
+            .and_then(|resource| {
+                serde_json::to_string(&resource.value)
+                    .map_err(|error| McpError::internal_error(error.to_string(), None))
+                    .map(|text| {
+                        ReadResourceResult::new(vec![
+                            ResourceContents::text(text, resource.uri)
+                                .with_mime_type(resource.mime_type),
+                        ])
+                    })
+            });
+        std::future::ready(result)
     }
 }
 
